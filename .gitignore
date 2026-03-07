@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.claude/
+*.ipynb
+training_notebook_cells.md
+CLAUDE.md
