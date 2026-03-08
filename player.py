@@ -2,15 +2,15 @@ import chess
 import random
 import torch
 import torch.nn.functional as F
-from typing import Optional, List, Dict
+from typing import Optional, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from chess_tournament.players import Player
 
 
 # ---------------------------------------------------------------------------
-# Opening book: strong moves for common positions (38 entries)
-# Used as a heuristic bonus (+3.0), NOT as a bypass — LLM always runs
+# Opening book: strong moves for common positions
+# Used as a heuristic bonus (+0.5), NOT as a bypass — LLM always runs
 # ---------------------------------------------------------------------------
 OPENING_BOOK = {
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w": "e2e4",
@@ -51,6 +51,31 @@ OPENING_BOOK = {
     "rnbqkbnr/ppp1pppp/8/3p4/3P1B2/8/PPP1PPPP/RN1QKBNR b": "g8f6",
     "rnbqkb1r/pppp1ppp/4pn2/8/2PP4/8/PP2PPPP/RNBQKBNR w": "b1c3",
     "rnbqk2r/pppp1ppp/4pn2/8/1bPP4/2N5/PP2PPPP/R1BQKBNR w": "e2e3",
+    # Ruy Lopez mainline continuations
+    "r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w": "b5a4",
+    "r1bqkbnr/1ppp1ppp/p1n5/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R w": "e1g1",
+    # Italian Game continuations
+    "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w": "c2c3",
+    "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2BPP3/5N2/PPP2PPP/RNBQK2R b": "e5d4",
+    # Scotch Game
+    "r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b": "e5d4",
+    "r1bqkbnr/pppp1ppp/2n5/8/3pP3/5N2/PPP2PPP/RNBQKB1R w": "f3d4",
+    # Queen's Gambit Declined mainline
+    "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR b": "g8f6",
+    "rnbqkb1r/ppp2ppp/4pn2/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR w": "c1g5",
+    "rnbqkb1r/ppp2ppp/4pn2/3p2B1/2PP4/2N5/PP2PPPP/R2QKBNR b": "f8e7",
+    # Sicilian Dragon
+    "rnbqkb1r/pp2pp1p/3p1np1/8/3NP3/2N5/PPP2PPP/R1BQKB1R w": "f1e2",
+    # Caro-Kann mainline
+    "rnbqkbnr/pp2pppp/2p5/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR b": "d5e4",
+    "rnbqkbnr/pp2pppp/2p5/8/3Pp3/2N5/PPP2PPP/R1BQKBNR w": "c3e4",
+    # King's Indian deeper
+    "rnbq1rk1/ppp1ppbp/3p1np1/8/2PPP3/2N2N2/PP3PPP/R1BQKB1R w": "f1e2",
+    # London System
+    "rnbqkb1r/ppp1pppp/5n2/3p4/3P1B2/5N2/PPP1PPPP/RN1QKB1R b": "c7c5",
+    # English Opening
+    "rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b": "e7e5",
+    "rnbqkbnr/pppp1ppp/8/4p3/2P5/8/PP1PPPPP/RNBQKBNR w": "b1c3",
 }
 
 # Center distance table for king centralization in endgames
@@ -186,6 +211,10 @@ class TransformerPlayer(Player):
         # --- Stalemate avoidance (-10.0) — never stalemate opponent ---
         if gives_stalemate:
             adjusted -= 10.0
+
+        # --- Check bonus (+0.15) — restrict opponent's responses ---
+        if gives_check:
+            adjusted += 0.15
 
         # --- Repetition penalty — avoid draw by repetition ---
         if repeat_count >= 1:
