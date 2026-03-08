@@ -174,16 +174,55 @@ class TransformerPlayer(Player):
         if move.promotion is not None:
             adjusted += 1.0
 
+        # --- Smart capture bonus — take free/winning captures ---
+        captured_piece = board.piece_at(move.to_square)
+        moving_piece = board.piece_at(move.from_square)
+        if captured_piece is not None and moving_piece is not None:
+            cap_val = self.PIECE_VALUES.get(captured_piece.piece_type, 0)
+            mov_val = self.PIECE_VALUES.get(moving_piece.piece_type, 0)
+            # Check if the destination square is attacked by opponent after capture
+            board.push(move)
+            is_recapturable = board.is_attacked_by(board.turn, move.to_square)
+            board.pop()
+            if not is_recapturable:
+                # Free capture — bonus proportional to captured value
+                adjusted += 0.15 * cap_val
+            elif cap_val > mov_val:
+                # Winning trade — bonus for net gain
+                adjusted += 0.15 * (cap_val - mov_val)
+            elif cap_val == mov_val:
+                # Equal trade — small bonus when ahead in material
+                our_mat = self._count_material(board, our_color)
+                opp_mat = self._count_material(board, not our_color)
+                if our_mat >= opp_mat + 3:
+                    adjusted += 0.2
+
+        # --- Hanging piece avoidance — penalize moving to attacked squares ---
+        if moving_piece is not None and captured_piece is None:
+            mov_val = self.PIECE_VALUES.get(moving_piece.piece_type, 0)
+            if mov_val >= 3:  # knights, bishops, rooks, queens
+                board.push(move)
+                is_attacked = board.is_attacked_by(board.turn, move.to_square)
+                is_defended = board.is_attacked_by(not board.turn, move.to_square)
+                board.pop()
+                if is_attacked and not is_defended:
+                    adjusted -= 0.1 * mov_val
+
         # --- Endgame: push pawns toward promotion ---
         if is_endgame:
-            piece = board.piece_at(move.from_square)
-            if piece is not None and piece.piece_type == chess.PAWN:
+            if moving_piece is not None and moving_piece.piece_type == chess.PAWN:
                 if our_color == chess.WHITE:
                     rank = chess.square_rank(move.to_square)
                     adjusted += 0.05 * rank
                 else:
                     rank = 7 - chess.square_rank(move.to_square)
                     adjusted += 0.05 * rank
+            # King centralization in endgame
+            if moving_piece is not None and moving_piece.piece_type == chess.KING:
+                from_dist = _KING_CENTER_DISTANCE[move.from_square]
+                to_dist = _KING_CENTER_DISTANCE[move.to_square]
+                if to_dist < from_dist:
+                    adjusted += 0.1
 
         return adjusted
 
