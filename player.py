@@ -108,9 +108,14 @@ class TransformerPlayer(Player):
     # Prompt
     # ------------------------------------------------------------------
     def _build_prompt(self, fen: str) -> str:
+        # Extract whose turn it is from FEN
+        turn = fen.split()[1]
+        color_name = "White" if turn == 'w' else "Black"
+        
         return (
             "You are a chess engine. Given the board position in FEN notation, "
-            "output the best legal move in UCI format (e.g. e2e4). "
+            f"output the best legal move for {color_name} in UCI format (e.g., e2e4, e7e5, g1f3). "
+            "Consider tactics, piece safety, and positional advantages. "
             "Output ONLY the move, nothing else.\n\n"
             f"FEN: {fen}\nMove:"
         )
@@ -151,10 +156,37 @@ class TransformerPlayer(Player):
             board.pop()
             return raw_score + 20.0
         gives_stalemate = board.is_stalemate()
+        gives_check = board.is_check()
         # Check for repetition after this move
         resulting_fen = " ".join(board.fen().split()[:4])
         repeat_count = self.position_history.count(resulting_fen)
+
+        # --- Mate-in-2 detection (+15.0) — find forced mates ---
+        mate_in_2 = False
+        if gives_check:
+            opponent_moves = list(board.legal_moves)
+            if opponent_moves:
+                all_lead_to_mate = True
+                for opp_move in opponent_moves:
+                    board.push(opp_move)
+                    found_mate = False
+                    for our_reply in board.legal_moves:
+                        board.push(our_reply)
+                        if board.is_checkmate():
+                            found_mate = True
+                            board.pop()
+                            break
+                        board.pop()
+                    board.pop()
+                    if not found_mate:
+                        all_lead_to_mate = False
+                        break
+                mate_in_2 = all_lead_to_mate
+
         board.pop()
+
+        if mate_in_2:
+            return raw_score + 15.0
 
         # --- Stalemate avoidance (-10.0) — never stalemate opponent ---
         if gives_stalemate:
