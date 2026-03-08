@@ -227,8 +227,8 @@ class TransformerPlayer(Player):
                     lp = F.log_softmax(cont_out.logits[0, i, :].float(), dim=-1)
                     score += lp[move_tokens[i + 1]].item()
 
-            # Length normalization
-            score /= len(move_tokens)
+            # Weak length normalization (alpha=0.3) to reduce tokenization bias
+            score /= len(move_tokens) ** 0.3
 
             # Apply chess heuristic adjustments
             score = self._adjust_score(board, move_str, score)
