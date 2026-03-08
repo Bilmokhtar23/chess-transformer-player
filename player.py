@@ -1,62 +1,44 @@
 import chess
 import random
-import re
 import torch
 import torch.nn.functional as F
-from typing import Optional, List
+from typing import Optional, List, Dict
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from chess_tournament.players import Player
 
 
 # ---------------------------------------------------------------------------
-# Opening book: strong first moves for common positions (38 entries)
-# Key = first two FEN fields (board + active color)
+# Opening book: strong moves for common positions (38 entries)
+# Used as a heuristic bonus (+3.0), NOT as a bypass — LLM always runs
 # ---------------------------------------------------------------------------
 OPENING_BOOK = {
-    # === WHITE'S FIRST MOVE ===
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w": "e2e4",
-
-    # === RESPONSES TO 1.e4 (Black) ===
     "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b": "e7e5",
-
-    # === ITALIAN GAME (White) ===
     "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w": "g1f3",
     "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w": "f1c4",
     "r1bqk1nr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w": "d2d4",
     "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w": "d2d3",
-
-    # === ITALIAN GAME (Black) ===
     "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b": "b8c6",
     "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b": "f8c5",
-
-    # === SICILIAN DEFENSE ===
     "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w": "g1f3",
     "rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w": "d2d4",
     "r1bqkbnr/pp1ppppp/2n5/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w": "d2d4",
     "rnbqkbnr/pp2pppp/3p4/8/3pP3/5N2/PPP2PPP/RNBQKB1R w": "f3d4",
     "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b": "d7d6",
-
-    # === FRENCH DEFENSE ===
     "rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w": "d2d4",
     "rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/8/PPP2PPP/RNBQKBNR w": "b1c3",
     "rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b": "d7d5",
-
-    # === CARO-KANN ===
     "rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w": "d2d4",
     "rnbqkbnr/pp2pppp/2p5/3p4/3PP3/8/PPP2PPP/RNBQKBNR w": "b1c3",
     "rnbqkbnr/pp2pppp/2p5/8/3Pp3/2N5/PPP2PPP/R1BQKBNR w": "c3e4",
     "rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b": "d7d5",
-
-    # === QUEEN'S GAMBIT ===
     "rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w": "c2c4",
     "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w": "b1c3",
     "rnbqkbnr/pp2pppp/2p5/3p4/2PP4/8/PP2PPPP/RNBQKBNR w": "g1f3",
     "rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR w": "g1f3",
     "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b": "d7d5",
     "rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b": "e7e6",
-
-    # === KING'S INDIAN DEFENSE ===
     "rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w": "c2c4",
     "rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w": "b1c3",
     "rnbqk2r/ppppppbp/5np1/8/2PP4/2N5/PP2PPPP/R1BQKBNR w": "e2e4",
@@ -64,28 +46,26 @@ OPENING_BOOK = {
     "rnbqkb1r/pppppppp/5n2/8/2PP4/8/PP2PPPP/RNBQKBNR b": "g7g6",
     "rnbqkb1r/pppppp1p/5np1/8/2PP4/2N5/PP2PPPP/R1BQKBNR b": "f8g7",
     "rnbqk2r/ppppppbp/5np1/8/2PPP3/2N5/PP3PPP/R1BQKBNR b": "d7d6",
-
-    # === RUY LOPEZ ===
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b": "a7a6",
     "r1bqkbnr/1ppp1ppp/p1n5/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R b": "g8f6",
-
-    # === LONDON SYSTEM (Black response) ===
     "rnbqkbnr/ppp1pppp/8/3p4/3P1B2/8/PPP1PPPP/RN1QKBNR b": "g8f6",
-
-    # === NIMZO-INDIAN ===
     "rnbqkb1r/pppp1ppp/4pn2/8/2PP4/8/PP2PPPP/RNBQKBNR w": "b1c3",
     "rnbqk2r/pppp1ppp/4pn2/8/1bPP4/2N5/PP2PPPP/R1BQKBNR w": "e2e3",
 }
+
+# Center distance table for king centralization in endgames
+_KING_CENTER_DISTANCE = {}
+for sq in range(64):
+    file_dist = abs(chess.square_file(sq) - 3.5)
+    rank_dist = abs(chess.square_rank(sq) - 3.5)
+    _KING_CENTER_DISTANCE[sq] = file_dist + rank_dist
 
 
 class TransformerPlayer(Player):
     """
     Chess player using a fine-tuned Qwen2.5-0.5B model.
-    Features:
-    - Opening book for the first few moves
-    - Log-probability scoring with length normalization
-    - Capture/check/castling heuristic bonuses
-    - Fallback to first legal move (0% fallback rate)
+    The LLM scores all legal moves by log-probability. Rule-based heuristics
+    complement the LLM scores to improve move selection.
     """
 
     PIECE_VALUES = {
@@ -98,22 +78,14 @@ class TransformerPlayer(Player):
         self,
         name: str,
         model_id: str = "Bilmokhtar23/chess-qwen2.5-0.5b-v2",
-        temperature: float = 0.2,
-        max_new_tokens: int = 8,
-        num_candidates: int = 10,
     ):
         super().__init__(name)
-
         self.model_id = model_id
-        self.temperature = temperature
-        self.max_new_tokens = max_new_tokens
-        self.num_candidates = num_candidates
-
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Lazy-loaded
         self.tokenizer = None
         self.model = None
+        # Track position history for repetition detection
+        self.position_history: List[str] = []
 
     # ------------------------------------------------------------------
     # Lazy loading
@@ -125,7 +97,6 @@ class TransformerPlayer(Player):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
             dtype=torch.float16 if self.device == "cuda" else torch.float32,
@@ -134,24 +105,31 @@ class TransformerPlayer(Player):
         self.model.eval()
 
     # ------------------------------------------------------------------
-    # Opening book lookup
+    # Prompt
     # ------------------------------------------------------------------
-    def _get_book_move(self, fen: str, board: chess.Board) -> Optional[str]:
-        """Return a book move if the position is in the opening book."""
-        key = " ".join(fen.split()[:2])
-        move_str = OPENING_BOOK.get(key)
-        if move_str is None:
-            return None
-        try:
-            move = chess.Move.from_uci(move_str)
-            if move in board.legal_moves:
-                return move_str
-        except Exception:
-            pass
-        return None
+    def _build_prompt(self, fen: str) -> str:
+        return (
+            "You are a chess engine. Given the board position in FEN notation, "
+            "output the best legal move in UCI format (e.g. e2e4). "
+            "Output ONLY the move, nothing else.\n\n"
+            f"FEN: {fen}\nMove:"
+        )
 
     # ------------------------------------------------------------------
-    # Chess heuristic scoring
+    # Material counting
+    # ------------------------------------------------------------------
+    def _count_material(self, board: chess.Board, color: chess.Color) -> int:
+        material = 0
+        for piece_type, value in self.PIECE_VALUES.items():
+            material += len(board.pieces(piece_type, color)) * value
+        return material
+
+    def _is_endgame(self, board: chess.Board) -> bool:
+        total = self._count_material(board, chess.WHITE) + self._count_material(board, chess.BLACK)
+        return total <= 26  # roughly when queens are off + some pieces traded
+
+    # ------------------------------------------------------------------
+    # Chess heuristic scoring (complements the LLM)
     # ------------------------------------------------------------------
     def _adjust_score(self, board: chess.Board, move_str: str, raw_score: float) -> float:
         """Adjust raw log-prob score with chess heuristics."""
@@ -165,53 +143,96 @@ class TransformerPlayer(Player):
 
         adjusted = raw_score
         is_early_game = board.fullmove_number <= 15
+        is_endgame = self._is_endgame(board)
+        our_color = board.turn
 
-        # Bonus for captures, weighted by piece value
+        # --- Checkmate detection (+20.0) ---
+        board.push(move)
+        if board.is_checkmate():
+            board.pop()
+            return raw_score + 20.0
+        is_check = board.is_check()
+        gives_stalemate = board.is_stalemate()
+        # Check for repetition after this move
+        resulting_fen = " ".join(board.fen().split()[:4])
+        repeat_count = self.position_history.count(resulting_fen)
+        board.pop()
+
+        # --- Stalemate avoidance (-15.0) ---
+        if gives_stalemate:
+            adjusted -= 15.0
+
+        # --- Check bonus ---
+        if is_check:
+            adjusted += 0.8
+
+        # --- Capture bonus (scaled by piece value) ---
         if board.is_capture(move):
             captured_piece = board.piece_at(move.to_square)
             if captured_piece is not None:
                 value = self.PIECE_VALUES.get(captured_piece.piece_type, 1)
-                adjusted += 0.1 * value
+                adjusted += 0.3 * value  # max 2.7 for queen capture
             else:
-                adjusted += 0.1  # en passant
+                adjusted += 0.3  # en passant
 
-        # Bonus for checks
-        board.push(move)
-        if board.is_check():
-            adjusted += 0.3
-        board.pop()
+        # --- Repetition penalty ---
+        if repeat_count >= 1:
+            adjusted -= 2.0 * repeat_count
 
-        # Center control in opening/midgame
+        # --- Opening book bonus (+3.0) ---
+        book_key = " ".join(board.fen().split()[:2])
+        book_move = OPENING_BOOK.get(book_key)
+        if book_move == move_str:
+            adjusted += 3.0
+
+        # --- Castling bonus (king safety) ---
+        if board.is_castling(move):
+            adjusted += 1.0
+
+        # --- Promotion bonus ---
+        if move.promotion is not None:
+            adjusted += 1.5
+
+        # --- Center control in opening ---
         if is_early_game and move.to_square in self.CENTER_SQUARES:
-            adjusted += 0.2
+            adjusted += 0.3
 
-        # Penalty for moving king early (except castling)
+        # --- Penalty for moving king early (except castling) ---
         if is_early_game:
             piece = board.piece_at(move.from_square)
             if piece is not None and piece.piece_type == chess.KING:
                 if not board.is_castling(move):
-                    adjusted -= 0.3
+                    adjusted -= 0.5
 
-        # Bonus for castling (king safety)
-        if board.is_castling(move):
-            adjusted += 0.4
+        # --- Endgame heuristics ---
+        if is_endgame:
+            piece = board.piece_at(move.from_square)
+            if piece is not None:
+                # Pawn advancement bonus (push pawns toward promotion)
+                if piece.piece_type == chess.PAWN:
+                    if our_color == chess.WHITE:
+                        rank = chess.square_rank(move.to_square)
+                        adjusted += 0.15 * rank  # rank 6 = +0.9, rank 7 = +1.05
+                    else:
+                        rank = 7 - chess.square_rank(move.to_square)
+                        adjusted += 0.15 * rank
 
-        # Bonus for promotion
-        if move.promotion is not None:
-            adjusted += 0.5
+                # King centralization bonus in endgame
+                if piece.piece_type == chess.KING:
+                    from_dist = _KING_CENTER_DISTANCE[move.from_square]
+                    to_dist = _KING_CENTER_DISTANCE[move.to_square]
+                    if to_dist < from_dist:
+                        adjusted += 0.4  # moving king toward center
+
+        # --- Avoid hanging pieces (penalize moving to attacked squares) ---
+        if not board.is_capture(move):
+            piece = board.piece_at(move.from_square)
+            if piece is not None and piece.piece_type != chess.KING:
+                if board.is_attacked_by(not our_color, move.to_square):
+                    piece_value = self.PIECE_VALUES.get(piece.piece_type, 1)
+                    adjusted -= 0.1 * piece_value
 
         return adjusted
-
-    # ------------------------------------------------------------------
-    # Prompt
-    # ------------------------------------------------------------------
-    def _build_prompt(self, fen: str) -> str:
-        return (
-            "You are a chess engine. Given the board position in FEN notation, "
-            "output the best legal move in UCI format (e.g. e2e4). "
-            "Output ONLY the move, nothing else.\n\n"
-            f"FEN: {fen}\nMove:"
-        )
 
     # ------------------------------------------------------------------
     # Log-prob scoring with length normalization + heuristics
@@ -239,10 +260,8 @@ class TransformerPlayer(Player):
             if not move_tokens:
                 continue
 
-            # Score first token using cached prompt logits
             score = first_log_probs[move_tokens[0]].item()
 
-            # Score remaining tokens using KV-cache continuation
             if len(move_tokens) > 1:
                 move_ids = torch.tensor(
                     [move_tokens], device=self.device
@@ -255,7 +274,7 @@ class TransformerPlayer(Player):
                     lp = F.log_softmax(cont_out.logits[0, i, :].float(), dim=-1)
                     score += lp[move_tokens[i + 1]].item()
 
-            # Length normalization: average log-prob per token
+            # Length normalization
             score /= len(move_tokens)
 
             # Apply chess heuristic adjustments
@@ -277,12 +296,11 @@ class TransformerPlayer(Player):
         if not legal_moves:
             return None
 
-        # --- Opening book ---
-        book_move = self._get_book_move(fen, board)
-        if book_move is not None:
-            return book_move
+        # Track position history for repetition detection
+        position_key = " ".join(fen.split()[:4])
+        self.position_history.append(position_key)
 
-        # --- Load model (lazy) ---
+        # Load model (lazy)
         try:
             self._load_model()
         except Exception:
@@ -290,7 +308,7 @@ class TransformerPlayer(Player):
 
         prompt = self._build_prompt(fen)
 
-        # --- Primary: log-prob scoring with heuristics ---
+        # LLM scores all legal moves, heuristics adjust the scores
         try:
             best = self._score_moves_by_logprob(prompt, legal_moves, board)
             if best is not None:
@@ -298,5 +316,5 @@ class TransformerPlayer(Player):
         except Exception:
             pass
 
-        # --- Fallback: first legal move ---
+        # Fallback: first legal move
         return legal_moves[0]
