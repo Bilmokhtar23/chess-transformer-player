@@ -78,26 +78,19 @@ OPENING_BOOK = {
     "rnbqkbnr/pppp1ppp/8/4p3/2P5/8/PP1PPPPP/RNBQKBNR w": "b1c3",
 }
 
-# Center distance table for king centralization in endgames
-_KING_CENTER_DISTANCE = {}
-for sq in range(64):
-    file_dist = abs(chess.square_file(sq) - 3.5)
-    rank_dist = abs(chess.square_rank(sq) - 3.5)
-    _KING_CENTER_DISTANCE[sq] = file_dist + rank_dist
-
 
 class TransformerPlayer(Player):
     """
     Chess player using a fine-tuned Qwen2.5-0.5B model.
-    The LLM scores all legal moves by log-probability. Rule-based heuristics
-    complement the LLM scores to improve move selection.
+    The LLM scores all legal moves by log-probability. Minimal rule-based
+    heuristics complement the LLM for things it structurally cannot do
+    (detect checkmate, avoid stalemate, avoid repetition draws).
     """
 
     PIECE_VALUES = {
         chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
         chess.ROOK: 5, chess.QUEEN: 9,
     }
-    CENTER_SQUARES = {chess.E4, chess.D4, chess.E5, chess.D5}
 
     def __init__(
         self,
@@ -109,8 +102,9 @@ class TransformerPlayer(Player):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = None
         self.model = None
-        # Track position history for repetition detection
+        # Track position history for repetition detection (per game)
         self.position_history: List[str] = []
+        self._last_fen_fullmove = None  # detect new game
 
     # ------------------------------------------------------------------
     # Lazy loading
@@ -151,13 +145,29 @@ class TransformerPlayer(Player):
 
     def _is_endgame(self, board: chess.Board) -> bool:
         total = self._count_material(board, chess.WHITE) + self._count_material(board, chess.BLACK)
-        return total <= 26  # roughly when queens are off + some pieces traded
+        return total <= 26
+
+    # ------------------------------------------------------------------
+    # Detect new game (reset position history)
+    # ------------------------------------------------------------------
+    def _detect_new_game(self, fen: str):
+        """Reset position history when a new game starts."""
+        parts = fen.split()
+        fullmove = int(parts[5]) if len(parts) > 5 else 1
+        turn = parts[1] if len(parts) > 1 else "w"
+        # New game: fullmove=1 and it's white's turn, OR fullmove decreased
+        if (fullmove == 1 and turn == "w") or (
+            self._last_fen_fullmove is not None and fullmove < self._last_fen_fullmove
+        ):
+            self.position_history = []
+        self._last_fen_fullmove = fullmove
 
     # ------------------------------------------------------------------
     # Chess heuristic scoring (complements the LLM)
+    # Only for things the model STRUCTURALLY cannot do
     # ------------------------------------------------------------------
     def _adjust_score(self, board: chess.Board, move_str: str, raw_score: float) -> float:
-        """Adjust raw log-prob score with chess heuristics."""
+        """Adjust raw log-prob score with minimal chess heuristics."""
         try:
             move = chess.Move.from_uci(move_str)
         except (chess.InvalidMoveError, ValueError):
@@ -175,46 +185,29 @@ class TransformerPlayer(Player):
         if board.is_checkmate():
             board.pop()
             return raw_score + 20.0
+
         gives_stalemate = board.is_stalemate()
-        gives_check = board.is_check()
+        # Detect insufficient material draw
+        gives_draw = board.is_insufficient_material()
+
         # Check for repetition after this move
         resulting_fen = " ".join(board.fen().split()[:4])
         repeat_count = self.position_history.count(resulting_fen)
 
-        # --- Mate-in-2 detection (+15.0) — find forced mates ---
-        mate_in_2 = False
-        if gives_check:
-            opponent_moves = list(board.legal_moves)
-            if opponent_moves:
-                all_lead_to_mate = True
-                for opp_move in opponent_moves:
-                    board.push(opp_move)
-                    found_mate = False
-                    for our_reply in board.legal_moves:
-                        board.push(our_reply)
-                        if board.is_checkmate():
-                            found_mate = True
-                            board.pop()
-                            break
-                        board.pop()
-                    board.pop()
-                    if not found_mate:
-                        all_lead_to_mate = False
-                        break
-                mate_in_2 = all_lead_to_mate
-
         board.pop()
-
-        if mate_in_2:
-            return raw_score + 15.0
 
         # --- Stalemate avoidance (-10.0) — never stalemate opponent ---
         if gives_stalemate:
             adjusted -= 10.0
 
+        # --- Insufficient material avoidance (-5.0) ---
+        if gives_draw:
+            adjusted -= 5.0
+
         # --- Repetition penalty — avoid draw by repetition ---
+        # Strong penalty: -3.0 for first repeat, -6.0 for second (would trigger draw)
         if repeat_count >= 1:
-            adjusted -= 0.5 * repeat_count
+            adjusted -= 3.0 * repeat_count
 
         # --- Opening book bonus — nudge toward known good openings ---
         book_key = " ".join(board.fen().split()[:2])
@@ -224,18 +217,26 @@ class TransformerPlayer(Player):
 
         # --- Promotion bonus — always promote pawns ---
         if move.promotion is not None:
-            adjusted += 1.0
+            adjusted += 2.0
 
-        # --- Endgame: push pawns toward promotion ---
+        # --- Endgame: push pawns toward promotion (stronger bonus) ---
         if is_endgame:
             piece = board.piece_at(move.from_square)
             if piece is not None and piece.piece_type == chess.PAWN:
                 if our_color == chess.WHITE:
                     rank = chess.square_rank(move.to_square)
-                    adjusted += 0.05 * rank
+                    adjusted += 0.15 * rank  # 3x stronger than before
                 else:
                     rank = 7 - chess.square_rank(move.to_square)
-                    adjusted += 0.05 * rank
+                    adjusted += 0.15 * rank
+
+            # --- Endgame: centralize king (helps finish the game) ---
+            if piece is not None and piece.piece_type == chess.KING:
+                # Bonus for moving king toward center in endgame
+                from_center = abs(chess.square_file(move.from_square) - 3.5) + abs(chess.square_rank(move.from_square) - 3.5)
+                to_center = abs(chess.square_file(move.to_square) - 3.5) + abs(chess.square_rank(move.to_square) - 3.5)
+                if to_center < from_center:
+                    adjusted += 0.1
 
         return adjusted
 
@@ -279,8 +280,8 @@ class TransformerPlayer(Player):
                     lp = F.log_softmax(cont_out.logits[0, i, :].float(), dim=-1)
                     score += lp[move_tokens[i + 1]].item()
 
-            # Weak length normalization (alpha=0.3) to reduce tokenization bias
-            score /= len(move_tokens) ** 0.3
+            # Length normalization: match training (pure average, alpha=1.0)
+            score /= len(move_tokens)
 
             # Apply chess heuristic adjustments
             score = self._adjust_score(board, move_str, score)
@@ -300,6 +301,9 @@ class TransformerPlayer(Player):
 
         if not legal_moves:
             return None
+
+        # Detect new game and reset position history
+        self._detect_new_game(fen)
 
         # Track position history for repetition detection
         position_key = " ".join(fen.split()[:4])
