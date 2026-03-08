@@ -205,9 +205,8 @@ class TransformerPlayer(Player):
             adjusted -= 5.0
 
         # --- Repetition penalty — avoid draw by repetition ---
-        # Strong penalty: -3.0 for first repeat, -6.0 for second (would trigger draw)
         if repeat_count >= 1:
-            adjusted -= 3.0 * repeat_count
+            adjusted -= 0.5 * repeat_count
 
         # --- Opening book bonus — nudge toward known good openings ---
         book_key = " ".join(board.fen().split()[:2])
@@ -217,26 +216,18 @@ class TransformerPlayer(Player):
 
         # --- Promotion bonus — always promote pawns ---
         if move.promotion is not None:
-            adjusted += 2.0
+            adjusted += 1.0
 
-        # --- Endgame: push pawns toward promotion (stronger bonus) ---
+        # --- Endgame: push pawns toward promotion ---
         if is_endgame:
             piece = board.piece_at(move.from_square)
             if piece is not None and piece.piece_type == chess.PAWN:
                 if our_color == chess.WHITE:
                     rank = chess.square_rank(move.to_square)
-                    adjusted += 0.15 * rank  # 3x stronger than before
+                    adjusted += 0.05 * rank
                 else:
                     rank = 7 - chess.square_rank(move.to_square)
-                    adjusted += 0.15 * rank
-
-            # --- Endgame: centralize king (helps finish the game) ---
-            if piece is not None and piece.piece_type == chess.KING:
-                # Bonus for moving king toward center in endgame
-                from_center = abs(chess.square_file(move.from_square) - 3.5) + abs(chess.square_rank(move.from_square) - 3.5)
-                to_center = abs(chess.square_file(move.to_square) - 3.5) + abs(chess.square_rank(move.to_square) - 3.5)
-                if to_center < from_center:
-                    adjusted += 0.1
+                    adjusted += 0.05 * rank
 
         return adjusted
 
@@ -280,8 +271,8 @@ class TransformerPlayer(Player):
                     lp = F.log_softmax(cont_out.logits[0, i, :].float(), dim=-1)
                     score += lp[move_tokens[i + 1]].item()
 
-            # Length normalization: match training (pure average, alpha=1.0)
-            score /= len(move_tokens)
+            # Weak length normalization (alpha=0.3) to reduce tokenization bias
+            score /= len(move_tokens) ** 0.3
 
             # Apply chess heuristic adjustments
             score = self._adjust_score(board, move_str, score)
