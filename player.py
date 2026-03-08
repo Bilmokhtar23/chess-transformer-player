@@ -69,10 +69,14 @@ class TransformerPlayer(Player):
     """
 
     PIECE_VALUES = {
-        chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+        chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3.2,
         chess.ROOK: 5, chess.QUEEN: 9,
     }
     CENTER_SQUARES = {chess.E4, chess.D4, chess.E5, chess.D5}
+    EXTENDED_CENTER = {chess.C3, chess.C4, chess.C5, chess.C6,
+                       chess.D3, chess.D4, chess.D5, chess.D6,
+                       chess.E3, chess.E4, chess.E5, chess.E6,
+                       chess.F3, chess.F4, chess.F5, chess.F6}
 
     def __init__(
         self,
@@ -132,6 +136,10 @@ class TransformerPlayer(Player):
     def _is_endgame(self, board: chess.Board) -> bool:
         total = self._count_material(board, chess.WHITE) + self._count_material(board, chess.BLACK)
         return total <= 26  # roughly when queens are off + some pieces traded
+    
+    def _is_opening(self, board: chess.Board) -> bool:
+        """Check if we're still in the opening phase."""
+        return board.fullmove_number <= 12
 
     # ------------------------------------------------------------------
     # Chess heuristic scoring (complements the LLM)
@@ -148,6 +156,7 @@ class TransformerPlayer(Player):
 
         adjusted = raw_score
         is_endgame = self._is_endgame(board)
+        is_opening = self._is_opening(board)
         our_color = board.turn
 
         # --- Checkmate detection (+20.0) — never miss mate-in-1 ---
@@ -163,9 +172,9 @@ class TransformerPlayer(Player):
 
         # --- Mate-in-2 detection (+15.0) — find forced mates ---
         mate_in_2 = False
-        if gives_check:
+        if gives_check and not is_opening:  # Skip expensive check in opening
             opponent_moves = list(board.legal_moves)
-            if opponent_moves:
+            if opponent_moves and len(opponent_moves) <= 8:  # Only check if opponent has few options
                 all_lead_to_mate = True
                 for opp_move in opponent_moves:
                     board.push(opp_move)
@@ -194,17 +203,17 @@ class TransformerPlayer(Player):
 
         # --- Repetition penalty — avoid draw by repetition ---
         if repeat_count >= 1:
-            adjusted -= 0.5 * repeat_count
+            adjusted -= 1.0 * repeat_count  # Increased penalty
 
         # --- Opening book bonus — nudge toward known good openings ---
         book_key = " ".join(board.fen().split()[:2])
         book_move = OPENING_BOOK.get(book_key)
         if book_move == move_str:
-            adjusted += 0.5
+            adjusted += 1.5  # Increased from 0.5
 
         # --- Promotion bonus — always promote pawns ---
         if move.promotion is not None:
-            adjusted += 1.0
+            adjusted += 2.0  # Increased from 1.0
 
         # --- Smart capture bonus — take free/winning captures ---
         captured_piece = board.piece_at(move.to_square)
@@ -218,16 +227,16 @@ class TransformerPlayer(Player):
             board.pop()
             if not is_recapturable:
                 # Free capture — bonus proportional to captured value
-                adjusted += 0.15 * cap_val
+                adjusted += 0.3 * cap_val  # Increased from 0.15
             elif cap_val > mov_val:
                 # Winning trade — bonus for net gain
-                adjusted += 0.15 * (cap_val - mov_val)
+                adjusted += 0.25 * (cap_val - mov_val)  # Increased from 0.15
             elif cap_val == mov_val:
                 # Equal trade — small bonus when ahead in material
                 our_mat = self._count_material(board, our_color)
                 opp_mat = self._count_material(board, not our_color)
                 if our_mat >= opp_mat + 3:
-                    adjusted += 0.2
+                    adjusted += 0.3  # Increased from 0.2
 
         # --- Hanging piece avoidance — penalize moving to attacked squares ---
         if moving_piece is not None and captured_piece is None:
@@ -238,23 +247,58 @@ class TransformerPlayer(Player):
                 is_defended = board.is_attacked_by(not board.turn, move.to_square)
                 board.pop()
                 if is_attacked and not is_defended:
-                    adjusted -= 0.1 * mov_val
+                    adjusted -= 0.2 * mov_val  # Increased penalty from 0.1
+        
+        # --- Check bonus — giving check is often good ---
+        if gives_check:
+            adjusted += 0.3
+        
+        # --- Opening phase bonuses ---
+        if is_opening and moving_piece is not None:
+            # Develop knights and bishops
+            if moving_piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+                from_rank = chess.square_rank(move.from_square)
+                to_rank = chess.square_rank(move.to_square)
+                # Reward moving off back rank
+                if our_color == chess.WHITE and from_rank == 0 and to_rank > 0:
+                    adjusted += 0.4
+                elif our_color == chess.BLACK and from_rank == 7 and to_rank < 7:
+                    adjusted += 0.4
+            
+            # Center control in opening
+            if move.to_square in self.CENTER_SQUARES:
+                adjusted += 0.3
+            elif move.to_square in self.EXTENDED_CENTER:
+                adjusted += 0.15
+            
+            # Castling bonus
+            if board.is_castling(move):
+                adjusted += 0.8
+        
+        # --- Middlegame: piece activity ---
+        if not is_opening and not is_endgame and moving_piece is not None:
+            # Reward centralization
+            if move.to_square in self.EXTENDED_CENTER:
+                if moving_piece.piece_type == chess.KNIGHT:
+                    adjusted += 0.2
+                elif moving_piece.piece_type == chess.BISHOP:
+                    adjusted += 0.15
 
         # --- Endgame: push pawns toward promotion ---
         if is_endgame:
             if moving_piece is not None and moving_piece.piece_type == chess.PAWN:
                 if our_color == chess.WHITE:
                     rank = chess.square_rank(move.to_square)
-                    adjusted += 0.05 * rank
+                    adjusted += 0.1 * rank  # Increased from 0.05
                 else:
                     rank = 7 - chess.square_rank(move.to_square)
-                    adjusted += 0.05 * rank
-            # King centralization in endgame
+                    adjusted += 0.1 * rank  # Increased from 0.05
+            # King centralization and activity in endgame
             if moving_piece is not None and moving_piece.piece_type == chess.KING:
                 from_dist = _KING_CENTER_DISTANCE[move.from_square]
                 to_dist = _KING_CENTER_DISTANCE[move.to_square]
                 if to_dist < from_dist:
-                    adjusted += 0.1
+                    adjusted += 0.25  # Increased from 0.1
 
         return adjusted
 
