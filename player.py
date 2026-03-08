@@ -9,7 +9,8 @@ from chess_tournament.players import Player
 
 
 # Opening book: strong moves for common positions
-# Used as a heuristic bonus (+0.5) to complement the LLM
+# Used as a heuristic bonus (+0.5)
+# ---------------------------------------------------------------------------
 OPENING_BOOK = {
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w": "e2e4",
     "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b": "e7e5",
@@ -80,9 +81,9 @@ OPENING_BOOK = {
 class TransformerPlayer(Player):
     """
     Chess player using a fine-tuned Qwen2.5-0.5B model.
-    The LLM scores all legal moves by log-probability. Rule-based
-    heuristics complement the LLM to handle edge cases like
-    checkmate detection, stalemate avoidance, and repetition.
+    The LLM scores all legal moves by log-probability. Minimal rule-based
+    heuristics complement the LLM for things it structurally cannot do
+    (detect checkmate, avoid stalemate, avoid repetition draws).
     """
 
     PIECE_VALUES = {
@@ -100,11 +101,9 @@ class TransformerPlayer(Player):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = None
         self.model = None
-        # Track position history for repetition detection (per game)
         self.position_history: List[str] = []
-        self._last_fen_fullmove = None
+        self._last_fen_fullmove = None  
 
-    # ------------------------------------------------------------------
     # Lazy loading
     # ------------------------------------------------------------------
     def _load_model(self):
@@ -121,7 +120,6 @@ class TransformerPlayer(Player):
         self.model.to(self.device)
         self.model.eval()
 
-    # ------------------------------------------------------------------
     # Prompt
     # ------------------------------------------------------------------
     def _build_prompt(self, fen: str) -> str:
@@ -132,7 +130,6 @@ class TransformerPlayer(Player):
             f"FEN: {fen}\nMove:"
         )
 
-    # ------------------------------------------------------------------
     # Material counting
     # ------------------------------------------------------------------
     def _count_material(self, board: chess.Board, color: chess.Color) -> int:
@@ -145,7 +142,6 @@ class TransformerPlayer(Player):
         total = self._count_material(board, chess.WHITE) + self._count_material(board, chess.BLACK)
         return total <= 26
 
-    # ------------------------------------------------------------------
     # Detect new game (reset position history)
     # ------------------------------------------------------------------
     def _detect_new_game(self, fen: str):
@@ -153,18 +149,15 @@ class TransformerPlayer(Player):
         parts = fen.split()
         fullmove = int(parts[5]) if len(parts) > 5 else 1
         turn = parts[1] if len(parts) > 1 else "w"
-        # Detect new game start
         if (fullmove == 1 and turn == "w") or (
             self._last_fen_fullmove is not None and fullmove < self._last_fen_fullmove
         ):
             self.position_history = []
         self._last_fen_fullmove = fullmove
 
-    # ------------------------------------------------------------------
-    # Chess heuristic scoring (complements the LLM)
-    # ------------------------------------------------------------------
+    # Chess heuristic scoring 
     def _adjust_score(self, board: chess.Board, move_str: str, raw_score: float) -> float:
-        """Adjust raw log-prob score with chess heuristics."""
+        """Adjust raw log-prob score with minimal chess heuristics."""
         try:
             move = chess.Move.from_uci(move_str)
         except (chess.InvalidMoveError, ValueError):
@@ -177,14 +170,14 @@ class TransformerPlayer(Player):
         is_endgame = self._is_endgame(board)
         our_color = board.turn
 
-        # --- Checkmate detection (+20.0) ---
+        # --- Checkmate detection (+20.0)  ---
         board.push(move)
         if board.is_checkmate():
             board.pop()
             return raw_score + 20.0
 
         gives_stalemate = board.is_stalemate()
-        # Check for insufficient material
+        # Detect insufficient material draw
         gives_draw = board.is_insufficient_material()
 
         # Check for repetition after this move
@@ -193,7 +186,7 @@ class TransformerPlayer(Player):
 
         board.pop()
 
-        # --- Stalemate avoidance (-10.0) ---
+        # --- Stalemate avoidance (-10.0)  ---
         if gives_stalemate:
             adjusted -= 10.0
 
@@ -201,17 +194,16 @@ class TransformerPlayer(Player):
         if gives_draw:
             adjusted -= 5.0
 
-        # --- Repetition penalty (-0.5 per repeat) ---
+        # --- Repetition penalty — avoid draw by repetition ---
         if repeat_count >= 1:
             adjusted -= 0.5 * repeat_count
 
-        # --- Opening book bonus (+0.5) ---
         book_key = " ".join(board.fen().split()[:2])
         book_move = OPENING_BOOK.get(book_key)
         if book_move == move_str:
             adjusted += 0.5
 
-        # --- Promotion bonus (+1.0) ---
+        # --- Promotion bonus — always promote pawns ---
         if move.promotion is not None:
             adjusted += 1.0
 
@@ -228,7 +220,6 @@ class TransformerPlayer(Player):
 
         return adjusted
 
-    # ------------------------------------------------------------------
     # Log-prob scoring with length normalization + heuristics
     # ------------------------------------------------------------------
     def _score_moves_by_logprob(
@@ -268,7 +259,7 @@ class TransformerPlayer(Player):
                     lp = F.log_softmax(cont_out.logits[0, i, :].float(), dim=-1)
                     score += lp[move_tokens[i + 1]].item()
 
-            # Length normalization (alpha=0.3)
+            # Weak length normalization (alpha=0.3) to reduce tokenization bias
             score /= len(move_tokens) ** 0.3
 
             # Apply chess heuristic adjustments
@@ -280,7 +271,6 @@ class TransformerPlayer(Player):
 
         return best_move
 
-    # ------------------------------------------------------------------
     # Main API
     # ------------------------------------------------------------------
     def get_move(self, fen: str) -> Optional[str]:
@@ -297,7 +287,6 @@ class TransformerPlayer(Player):
         position_key = " ".join(fen.split()[:4])
         self.position_history.append(position_key)
 
-        # Load model (lazy)
         try:
             self._load_model()
         except Exception:
