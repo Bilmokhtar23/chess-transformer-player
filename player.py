@@ -142,95 +142,48 @@ class TransformerPlayer(Player):
             return raw_score
 
         adjusted = raw_score
-        is_early_game = board.fullmove_number <= 15
         is_endgame = self._is_endgame(board)
         our_color = board.turn
 
-        # --- Checkmate detection (+20.0) ---
+        # --- Checkmate detection (+20.0) — never miss mate-in-1 ---
         board.push(move)
         if board.is_checkmate():
             board.pop()
             return raw_score + 20.0
-        is_check = board.is_check()
         gives_stalemate = board.is_stalemate()
         # Check for repetition after this move
         resulting_fen = " ".join(board.fen().split()[:4])
         repeat_count = self.position_history.count(resulting_fen)
         board.pop()
 
-        # --- Stalemate avoidance (-15.0) ---
+        # --- Stalemate avoidance (-10.0) — never stalemate opponent ---
         if gives_stalemate:
-            adjusted -= 15.0
+            adjusted -= 10.0
 
-        # --- Check bonus ---
-        if is_check:
-            adjusted += 0.8
-
-        # --- Capture bonus (scaled by piece value) ---
-        if board.is_capture(move):
-            captured_piece = board.piece_at(move.to_square)
-            if captured_piece is not None:
-                value = self.PIECE_VALUES.get(captured_piece.piece_type, 1)
-                adjusted += 0.3 * value  # max 2.7 for queen capture
-            else:
-                adjusted += 0.3  # en passant
-
-        # --- Repetition penalty ---
+        # --- Repetition penalty — avoid draw by repetition ---
         if repeat_count >= 1:
-            adjusted -= 2.0 * repeat_count
+            adjusted -= 0.5 * repeat_count
 
-        # --- Opening book bonus (+3.0) ---
+        # --- Opening book bonus — nudge toward known good openings ---
         book_key = " ".join(board.fen().split()[:2])
         book_move = OPENING_BOOK.get(book_key)
         if book_move == move_str:
-            adjusted += 3.0
+            adjusted += 0.5
 
-        # --- Castling bonus (king safety) ---
-        if board.is_castling(move):
+        # --- Promotion bonus — always promote pawns ---
+        if move.promotion is not None:
             adjusted += 1.0
 
-        # --- Promotion bonus ---
-        if move.promotion is not None:
-            adjusted += 1.5
-
-        # --- Center control in opening ---
-        if is_early_game and move.to_square in self.CENTER_SQUARES:
-            adjusted += 0.3
-
-        # --- Penalty for moving king early (except castling) ---
-        if is_early_game:
-            piece = board.piece_at(move.from_square)
-            if piece is not None and piece.piece_type == chess.KING:
-                if not board.is_castling(move):
-                    adjusted -= 0.5
-
-        # --- Endgame heuristics ---
+        # --- Endgame: push pawns toward promotion ---
         if is_endgame:
             piece = board.piece_at(move.from_square)
-            if piece is not None:
-                # Pawn advancement bonus (push pawns toward promotion)
-                if piece.piece_type == chess.PAWN:
-                    if our_color == chess.WHITE:
-                        rank = chess.square_rank(move.to_square)
-                        adjusted += 0.15 * rank  # rank 6 = +0.9, rank 7 = +1.05
-                    else:
-                        rank = 7 - chess.square_rank(move.to_square)
-                        adjusted += 0.15 * rank
-
-                # King centralization bonus in endgame
-                if piece.piece_type == chess.KING:
-                    from_dist = _KING_CENTER_DISTANCE[move.from_square]
-                    to_dist = _KING_CENTER_DISTANCE[move.to_square]
-                    if to_dist < from_dist:
-                        adjusted += 0.4  # moving king toward center
-
-        # --- Avoid hanging pieces (penalize moving to attacked squares) ---
-        if not board.is_capture(move):
-            piece = board.piece_at(move.from_square)
-            if piece is not None and piece.piece_type != chess.KING:
-                if board.is_attacked_by(not our_color, move.to_square):
-                    piece_value = self.PIECE_VALUES.get(piece.piece_type, 1)
-                    adjusted -= 0.1 * piece_value
+            if piece is not None and piece.piece_type == chess.PAWN:
+                if our_color == chess.WHITE:
+                    rank = chess.square_rank(move.to_square)
+                    adjusted += 0.05 * rank
+                else:
+                    rank = 7 - chess.square_rank(move.to_square)
+                    adjusted += 0.05 * rank
 
         return adjusted
 
